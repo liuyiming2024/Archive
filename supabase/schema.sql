@@ -85,13 +85,30 @@ create index if not exists profile_media_path_idx on profile_media(path);
 -- 权限点登记：档案归站长
 insert into acl_perm_label (key, value) values ('site.profile', '查看人物档案')
   on conflict (key) do nothing;
-do $$
-begin
-  if exists (select 1 from information_schema.tables where table_name='acl_role_perms') then
-    update acl_role_perms set perms = array_append(perms, 'site.profile')
-    where role='owner' and not ('site.profile' = any(perms));
-  end if;
-end $$;
+/* ⚠ 这里原来有一段 `update acl_role_perms set perms = ... where role='owner'`
+   —— 那是**死代码**，已删除（ARCHIVE-ACL-DEADCODE）。
+
+   实测（2026-10-15，只读体检确认）：
+     · 线上**没有** acl_role_perms 这个**表**，只有同名**函数** acl_role_perms(text)
+     · 原来那句用 `if exists (... tables where table_name='acl_role_perms')` 包着，
+       表不存在 → 整段静默跳过，**不报错**
+     · 结果：迁移看着"成功"，授权却根本没发生
+
+   那 owner 到底怎么拿到 site.profile 的？
+   看 acl_can() 的实现里有这一句：
+       if u.role = 'owner' then return true; end if;
+   **owner 在权限判定里被直接放行**，不依赖任何权限点清单。
+   所以 site.profile 不登记进数组也没关系 —— 这才是真实机制。
+
+   给后来人的提醒：
+     · 不要照着"角色权限表"的想象去写 SQL，先查线上真实结构
+     · 用 if exists 包住的操作，失败时是**静默**的；
+       这在生产上比直接报错危险得多 —— 报错你还会去查，静默你以为成功了
+     · 需要给 admin（非 owner）开放档案权限时，
+       正确做法是往该用户的 users.perms 里加 'site.profile'，
+       不是改什么角色表 */
+insert into acl_perm_label (key, value) values ('site.profile', '查看人物档案')
+  on conflict (key) do nothing;
 
 -- ==================================================================
 -- 函数。**每一个都先 acl_require** ——
