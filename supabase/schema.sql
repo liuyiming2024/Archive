@@ -415,3 +415,345 @@ grant execute on function profile_album(uuid) to anon, authenticated;
 grant execute on function profile_media_prepare(text, bigint) to anon, authenticated;
 grant execute on function profile_media_allowed(text) to anon, authenticated;
 grant execute on function profile_media_commit(text) to anon, authenticated;
+
+
+/* ==================================================================
+   API 端口（Q-Chat-S-129）—— 给外部 AI 整理档案数据用
+   ==================================================================
+
+   设计要点：
+
+   ★ **不预置任何 token**。
+     api_tokens 表建好时是空的 —— 端口处于**关闭**状态，
+     任何调用都会被拒。站长（owner）用 `api_token_create` 生成
+     第一个 token 之后，端口才真正可用。
+     ⚠ 这样"没配好"的表现是"明确拒绝"，而不是"意外放行"。
+
+   ★ token 存**哈希**不存明文。
+     数据库被读到也还原不出 token。明文只在生成的那一刻
+     返回一次，之后无法再取回（只能吊销重建）。
+
+   ★ scope 分 read / write。
+     只读的整理任务就给 read —— 写权限能改数据，
+     不该因为"反正都是我自己的 AI"就一律给全权。
+
+   ★ **铁律继承**：原文永不被覆盖。
+     所以**没有**任何 API 能改 `profile_entries.body`。
+     只有 `api_entry_polish` 写 `polished` 列。
+     给 AI 的端口也不能破这条规矩 ——
+     否则"用 AI 整理"反而成了最容易丢失原文的途径。
+
+   ★ 每个 token 记 last_used_at，可审计：
+     发现某个 token 在异常时间被用过，能定位到是哪一个。
+
+================================================================== */
+
+create table if not exists api_tokens (
+  id           uuid primary key default gen_random_uuid(),
+  name         text not null,                    -- 给谁用，自己看得懂就行
+  token_hash   text not null unique,             -- sha256(明文)
+  scope        text not null default 'read',     -- 'read' | 'write'
+  created_at   timestamptz not null default now(),
+  expires_at   timestamptz,                      -- 空 = 长期有效
+  revoked_at   timestamptz,                      -- 非空 = 已吊销
+  last_used_at timestamptz
+);
+
+/* ⚠ 不建 RLS：api_tokens 是**凭据表**，闸门在 api_check() 里。
+   建 RLS 反而可能让"创建新 token"被策略挡住而报不出原因。 */
+
+/* ----------------------------------------------------------------
+   api_check —— 内部校验。所有 api_* 函数第一行都调它。
+   ----------------------------------------------------------------
+   ⚠ 返回 void + 不合法就 raise exception，
+     而不是返回 boolean 让调用方自己判断 ——
+     **返回 boolean 的话，漏写一个 if 就是全站放行**。
+     抛异常是"忘了处理就必然失败"，这是更安全的默认。 */
+create or replace function api_check(p_token text, p_need_write boolean default false)
+returns uuid
+language plpgsql stable security definer
+set search_path = public, extensions, pg_temp as $$
+declare t record;
+begin
+  if p_token is null or p_token = '' then
+    raise exception '缺少 token';
+  end if;
+
+  select * into t from api_tokens k
+  where k.token_hash = encode(digest(p_token, 'sha256'), 'hex');
+
+  if not found then
+    /* ⚠ 刻意不区分"token 不存在"和"token 错了" ——
+       区分了就等于告诉对方"这个前缀是对的，继续试"。 */
+    raise exception 'token 无效';
+  end if;
+
+  if t.revoked_at is not null then
+    raise exception 'token 已吊销';
+  end if;
+
+  if t.expires_at is not null and t.expires_at < now() then
+    raise exception 'token 已过期';
+  end if;
+
+  if p_need_write and t.scope <> 'write' then
+    raise exception '这个 token 只有读权限，不能修改数据';
+  end if;
+
+  return t.id;
+end;
+$$;
+
+/* 记录使用时间（放在 stable 函数里不能改，所以单独一个 volatile 的） */
+create or replace function api_touch(p_token text) returns void
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  update api_tokens
+     set last_used_at = now()
+   where token_hash = encode(digest(p_token, 'sha256'), 'hex');
+end;
+$$;
+
+/* ================================================================
+   token 管理（仅站长）
+================================================================ */
+create or replace function api_token_create(
+  p_name text,
+  p_scope text default 'read',
+  p_days int default null          -- 多少天后过期；null = 长期
+) returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+declare v_plain text; v_id uuid;
+begin
+  perform acl_require('site.profile');          -- 只有站长/有档案权限者
+  if p_scope not in ('read','write') then
+    raise exception 'scope 只能是 read 或 write';
+  end if;
+
+  v_plain := 'atk_' || encode(gen_random_bytes(24), 'hex');
+  insert into api_tokens (name, token_hash, scope, expires_at)
+  values (p_name, encode(digest(v_plain,'sha256'),'hex'), p_scope,
+          case when p_days is null then null else now() + (p_days || ' days')::interval end)
+  returning id into v_id;
+
+  /* ⚠ 明文**只在这一次返回**。之后库里只有哈希，谁也取不回来 ——
+     包括站长自己。忘了就只能吊销重建，这是刻意的。 */
+  return json_build_object('ok', true, 'id', v_id, 'token', v_plain,
+                           'scope', p_scope, 'name', p_name);
+end;
+$$;
+
+create or replace function api_token_list() returns json
+language plpgsql stable security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform acl_require('site.profile');
+  return json_build_object('ok', true, 'tokens', coalesce((
+    select json_agg(json_build_object(
+      'id', k.id, 'name', k.name, 'scope', k.scope,
+      'createdAt', k.created_at, 'expiresAt', k.expires_at,
+      'revokedAt', k.revoked_at, 'lastUsedAt', k.last_used_at
+    )) from api_tokens k order by k.created_at desc
+  ), '[]'::json));
+end;
+$$;
+
+create or replace function api_token_revoke(p_id uuid) returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform acl_require('site.profile');
+  update api_tokens set revoked_at = now() where id = p_id and revoked_at is null;
+  if not found then raise exception 'token 不存在或已吊销'; end if;
+  return json_build_object('ok', true);
+end;
+$$;
+
+/* ================================================================
+   读
+================================================================ */
+
+/* 人员清单 —— AI 整理前先拿这个，才知道有哪些人 */
+create or replace function api_profile_list(p_token text) returns json
+language plpgsql stable security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform api_check(p_token);
+  perform api_touch(p_token);
+  /* ⚠ 这里踩过坑：`select json_agg(...) from profiles p order by ...`
+     会报 "column must appear in the GROUP BY clause" ——
+     json_agg 是聚合函数，order by 直接跟在 FROM 后会被当成窗口排序。
+     正确写法是把排序放进**子查询**（现有 profile_list 就是这么写的，
+     我第一版参考了它却没照抄结构）。 */
+  return json_build_object('ok', true, 'profiles', coalesce((
+    select json_agg(json_build_object(
+      'id', x.id, 'name', x.name, 'note', x.note,
+      'updatedAt', x.updated_at,
+      'entryCount', (select count(*) from profile_entries e where e.profile_id = x.id),
+      'noteCount',  (select count(*) from profile_notes n where n.profile_id = x.id)
+    )) from (
+      select p.id, p.name, p.note, p.updated_at
+        from profiles p order by p.updated_at desc
+    ) x
+  ), '[]'::json));
+end;
+$$;
+
+/* 大日记（随手记）。p_profile 可空 = 只要未归属的 */
+create or replace function api_entry_list(
+  p_token text, p_profile uuid default null, p_limit int default 100, p_offset int default 0
+) returns json
+language plpgsql stable security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform api_check(p_token);
+  perform api_touch(p_token);
+  if p_limit > 500 then p_limit := 500; end if;   -- 上限，防一次拖垮
+  return json_build_object('ok', true, 'entries', coalesce((
+    select json_agg(json_build_object(
+      'id', e.id, 'profileId', e.profile_id, 'body', e.body,
+      'polished', e.polished, 'images', e.images, 'createdAt', e.created_at
+    )) from (
+      select * from profile_entries e
+      where (p_profile is null or e.profile_id = p_profile)
+      order by e.created_at desc limit p_limit offset p_offset
+    ) e
+  ), '[]'::json));
+end;
+$$;
+
+/* 某人的小日记（已归类） */
+create or replace function api_note_list(p_token text, p_profile uuid) returns json
+language plpgsql stable security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform api_check(p_token);
+  perform api_touch(p_token);
+  return json_build_object('ok', true, 'notes', coalesce((
+    select json_agg(json_build_object(
+      'id', x.id, 'category', x.category, 'content', x.content,
+      'sourceIds', x.source_ids, 'happenedAt', x.happened_at, 'createdAt', x.created_at
+    )) from (
+      select n.id, n.category, n.content, n.source_ids, n.happened_at, n.created_at
+        from profile_notes n where n.profile_id = p_profile order by n.created_at desc
+    ) x
+  ), '[]'::json));
+end;
+$$;
+
+/* 某人的档案（第三层） */
+create or replace function api_summary_list(p_token text, p_profile uuid) returns json
+language plpgsql stable security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform api_check(p_token);
+  perform api_touch(p_token);
+  return json_build_object('ok', true, 'summaries', coalesce((
+    select json_agg(json_build_object(
+      'id', x.id, 'kind', x.kind, 'content', x.content, 'createdAt', x.created_at
+    )) from (
+      select s.id, s.kind, s.content, s.created_at
+        from profile_summaries s where s.profile_id = p_profile order by s.created_at desc
+    ) x
+  ), '[]'::json));
+end;
+$$;
+
+/* ================================================================
+   写（需要 scope='write'）
+================================================================ */
+
+create or replace function api_profile_create(p_token text, p_name text, p_note text default '')
+returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+declare v_id uuid;
+begin
+  perform api_check(p_token, true);
+  perform api_touch(p_token);
+  insert into profiles (name, note) values (p_name, p_note) returning id into v_id;
+  return json_build_object('ok', true, 'id', v_id);
+end;
+$$;
+
+/* 加随手记。★ 这是"原文"入口 —— 只能新增，没有对应的改/删 API */
+create or replace function api_entry_add(
+  p_token text, p_body text, p_profile uuid default null, p_images text[] default '{}'
+) returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+declare v_id uuid;
+begin
+  perform api_check(p_token, true);
+  perform api_touch(p_token);
+  insert into profile_entries (profile_id, body, images)
+  values (p_profile, p_body, coalesce(p_images,'{}')) returning id into v_id;
+  return json_build_object('ok', true, 'id', v_id);
+end;
+$$;
+
+/* 改写。★ 只写 polished —— body 是原文，任何 API 都不许碰。
+   AI 整理的主要动作就是这一个：读 body → 整理 → 写 polished。 */
+create or replace function api_entry_polish(p_token text, p_id uuid, p_polished text)
+returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform api_check(p_token, true);
+  perform api_touch(p_token);
+  update profile_entries set polished = p_polished where id = p_id;
+  if not found then raise exception '条目不存在：%', p_id; end if;
+  return json_build_object('ok', true);
+end;
+$$;
+
+/* 加小日记（已归类）。sourceIds 要能回溯到原始条目。 */
+create or replace function api_note_add(
+  p_token text, p_profile uuid, p_category text, p_content text,
+  p_source_ids uuid[] default '{}', p_happened_at timestamptz default null
+) returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+declare v_id uuid;
+begin
+  perform api_check(p_token, true);
+  perform api_touch(p_token);
+  insert into profile_notes (profile_id, category, content, source_ids, happened_at)
+  values (p_profile, p_category, p_content, coalesce(p_source_ids,'{}'), p_happened_at)
+  returning id into v_id;
+  return json_build_object('ok', true, 'id', v_id);
+end;
+$$;
+
+/* 加档案总结。★ 只新增，不覆盖 —— 整理错了能退回上一版 */
+create or replace function api_summary_add(
+  p_token text, p_profile uuid, p_kind text, p_content text
+) returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+declare v_id uuid;
+begin
+  perform api_check(p_token, true);
+  perform api_touch(p_token);
+  insert into profile_summaries (profile_id, kind, content)
+  values (p_profile, p_kind, p_content) returning id into v_id;
+  return json_build_object('ok', true, 'id', v_id);
+end;
+$$;
+
+grant execute on function api_check(text, boolean) to anon, authenticated;
+grant execute on function api_touch(text) to anon, authenticated;
+grant execute on function api_token_create(text, text, int) to anon, authenticated;
+grant execute on function api_token_list() to anon, authenticated;
+grant execute on function api_token_revoke(uuid) to anon, authenticated;
+grant execute on function api_profile_list(text) to anon, authenticated;
+grant execute on function api_entry_list(text, uuid, int, int) to anon, authenticated;
+grant execute on function api_note_list(text, uuid) to anon, authenticated;
+grant execute on function api_summary_list(text, uuid) to anon, authenticated;
+grant execute on function api_profile_create(text, text, text) to anon, authenticated;
+grant execute on function api_entry_add(text, text, uuid, text[]) to anon, authenticated;
+grant execute on function api_entry_polish(text, uuid, text) to anon, authenticated;
+grant execute on function api_note_add(text, uuid, text, text, uuid[], timestamptz) to anon, authenticated;
+grant execute on function api_summary_add(text, uuid, text, text) to anon, authenticated;
