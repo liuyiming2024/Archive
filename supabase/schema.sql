@@ -84,6 +84,22 @@ create index if not exists profile_media_path_idx on profile_media(path);
 
 -- 权限点登记：档案归站长
 insert into acl_perm_label (key, value) values ('site.profile', '查看人物档案')
+
+/* ================================================================
+   Q-Chat-S-127：权限点已并入全站统一 ACL
+   ================================================================
+   本库与聊天室连的是**同一个 Supabase**（pimryrsxkwyafmponegp.supabase.co），
+   共用 users / sessions / acl_can / acl_require。
+   所以这里不用自建账号体系，也不用自建权限表 ——
+   每个函数开头的 `perform acl_require('site.profile');` 就是闸门本体：
+   被拒绝直接抛异常、事务回滚，一个字都不会返回。
+
+   ⚠ 权限点注册在全站的 `site_perms` 表里（project = 'archive'）。
+     改名必须两边同步：这里 acl_require 用的 key，
+     必须在 site_perms 里有同名行，否则 admin 永远拿不到 ——
+     而 owner 靠 acl_can 里的"站长恒为全部"直接放行，
+     于是问题只在 admin 身上出现，站长自己测不出来。
+=============================================================== */
   on conflict (key) do nothing;
 /* ⚠ 这里原来有一段 `update acl_role_perms set perms = ... where role='owner'`
    —— 那是**死代码**，已删除（ARCHIVE-ACL-DEADCODE）。
