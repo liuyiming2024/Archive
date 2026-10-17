@@ -448,6 +448,33 @@ grant execute on function profile_media_commit(text) to anon, authenticated;
 
 ================================================================== */
 
+/* ================================================================
+   Q-Chat-S-131：数据层兜底（RLS + revoke）
+   ================================================================
+   ⚠⚠ 先说清楚这条**不是**在修一个正在发生的漏洞。
+
+   外部安全报告把"6 张表未启用 RLS / 全库无 revoke"列为 🔴，
+   但那是**静态审计**结论（报告自己也声明未实测）。
+   实测线上的结果（同一个 Supabase 库）：
+     · 未启 RLS 的表 = **0 张**（profiles / profile_entries / ... 全是 t）
+     · anon 对这些表 = **无任何权限**
+
+   为什么？因为**本库与 Chat 共库**（pimryrsxkwyafmponegp.supabase.co），
+   Chat 的迁移里已有 `alter table ... enable row level security`
+   和 `revoke all on all tables in schema public from anon, authenticated` ——
+   `all tables in schema public` 是**全 schema**，把本项目的表一起盖住了。
+
+   ★ 所以这条是误报。但仍要补，理由是**纵深防御**：
+     如果将来有人只拿本文件去建一个新库（Archive 独立部署 / 重建），
+     没有 Chat 那份兜底，这 6 张表就是**真的裸奔** ——
+     而本库存的是人物档案与日记，是最私密的数据。
+     "依赖另一个项目的迁移顺带保护自己"是脆弱的耦合，
+     哪天 Chat 改了表名或不再共库，防护就悄悄没了。
+
+   ⚠ 顺序不能反：**先 revoke 再 enable RLS**。
+     反过来的话，revoke 在 RLS 已启时可能被策略覆盖，行为不直观。
+=============================================================== */
+
 create table if not exists api_tokens (
   id           uuid primary key default gen_random_uuid(),
   name         text not null,                    -- 给谁用，自己看得懂就行
@@ -757,3 +784,312 @@ grant execute on function api_entry_add(text, text, uuid, text[]) to anon, authe
 grant execute on function api_entry_polish(text, uuid, text) to anon, authenticated;
 grant execute on function api_note_add(text, uuid, text, text, uuid[], timestamptz) to anon, authenticated;
 grant execute on function api_summary_add(text, uuid, text, text) to anon, authenticated;
+
+
+/* ==================================================================
+   草稿箱 / 收件箱（Q-Chat-S-130）
+   ==================================================================
+
+   提出人的原话：
+     "一个端口用于发送消息和文件到草稿箱中，发送时服务端自动带上时间戳，
+      草稿箱内按照时间戳排序，整理端可以删除草稿箱里的东西，
+      草稿箱里的东西就是我们下一次整理端口需要整理的。
+      然后你那个 API 自带上一段提示词吧。
+      至于这个普通端口，就不用密钥了，顶多给我当垃圾箱。"
+
+   据此的设计：
+
+   ★ **这个端口不要密钥**（提出人明确要求）。
+     理由：它是"丢进来"的入口，不是"取出去"的入口。
+     取数据、改数据仍然走上一节的 api_*（要 token）。
+     所以**没有密钥 ≠ 档案可被读取** —— 往里丢和往外拿是两回事。
+
+   ⚠ 但"不用密钥"意味着**任何人都能往里写**。
+     所以必须做三件事，否则它会被灌爆：
+       · 单条长度上限（正文 8000 字、文件名 200）
+       · 总量上限（超过 N 条拒绝，提示先整理）
+       · 频率限制（同一来源短时间内限次）
+
+   ★ **服务端自动打时间戳**，不接受客户端传的时间。
+     理由：客户端时间可以随便改。让他传，排序就失去意义 ——
+     "按时间排序的收件箱"里出现一条声称来自 1998 年的东西，
+     会直接破坏整理顺序。所以 happened_at 由 now() 写死。
+
+   ★ **只能删，不能改**。
+     草稿箱是"待整理队列"，改一条草稿等于伪造原始输入。
+     整理错了应该改的是整理结果（polished / notes），
+     不是改掉当初收到的那句话。
+
+   ★ 删除是**逻辑删除**（deleted_at），不物理删。
+     承总规划"删除 = 逻辑删除，给自己留退路"。
+
+   ★ 自带提示词：`draft_prompt()` 返回给整理端 AI 的指令。
+     ⚠ 提示词存在服务端而不是写死在调用方 ——
+     这样改提示词不用改所有客户端，
+     而整理端每次开工前拉一次，拿到的永远是最新的。
+
+================================================================== */
+
+create table if not exists drafts (
+  id         uuid primary key default gen_random_uuid(),
+  kind       text not null default 'text',   -- 'text' | 'file'
+  body       text not null default '',       -- 文字内容，或文件的说明
+  file_name  text,                           -- kind='file' 时的文件名
+  file_path  text,                           -- 文件已入库时的路径
+  file_size  bigint,
+  source     text not null default '',       -- 谁/哪个端丢进来的，自己填
+  /* ⚠ 用 clock_timestamp() 而不是 now() ——
+     实测踩坑：同一事务里连插 3 条，**三条时间戳完全相同**。
+     因为 now() 返回的是**事务开始时刻**，整个事务内固定不变。
+
+     后果：一次批量丢 3 条草稿，排序后谁先谁后是**不确定的**。
+     而"按时间排序的收件箱"正是这个端口的全部意义 ——
+     顺序不确定，整理端每次开工拿到的顺序都可能不一样，
+     已经整理过的和没整理过的会混在一起。
+
+     clock_timestamp() 返回**真实当前时刻**，逐条不同。
+     再加 sort_seq 兜底（见下），双保险。 */
+  created_at timestamptz not null default clock_timestamp(),
+  sort_seq   bigserial not null,     -- ★ 同时间戳时的稳定次序
+  deleted_at timestamptz             -- 逻辑删除
+);
+
+/* ⚠⚠ 又是同一个坑（本仓库第 3 次）：
+   `create table if not exists` **不会更新已存在的表**。
+   线上 drafts 表是上一版建的（没有 sort_seq、created_at 默认 now()），
+   所以只写 create 的话：
+     · sort_seq 列不存在 → 查询报 column does not exist
+     · clock_timestamp() 默认没生效 → 实测 5 条时间戳仍然**全部相同**
+
+   改已存在的表必须用 alter。这是"建新表"和"改老表"的区别，
+   我上一轮在 site_perms 加 scope 列时已经踩过一模一样的。 */
+alter table drafts add column if not exists sort_seq bigserial not null;
+alter table drafts alter column created_at set default clock_timestamp();
+
+create index if not exists drafts_pending_idx on drafts (created_at)
+  where deleted_at is null;
+
+/* ----------------------------------------------------------------
+   常量：上限
+----------------------------------------------------------------
+   ⚠ 无密钥入口必须限量。不限量的话，任何人写个循环就能把表灌满，
+     而整理端每次都要先拉全表 —— 结果就是整理端被拖垮，
+     真正的档案数据反而没人整理了。 */
+create or replace function draft_limits() returns json
+language sql immutable as $$
+  select json_build_object(
+    'maxBody',   8000,    -- 单条正文上限（字符）
+    'maxName',   200,     -- 文件名上限
+    'maxPending', 2000,   -- 未整理条目上限，超了拒绝新增
+    'perMinute',   30     -- 同一来源每分钟上限
+  );
+$$;
+
+/* ----------------------------------------------------------------
+   draft_add —— ★ 无需密钥。往草稿箱丢东西。
+---------------------------------------------------------------- */
+create or replace function draft_add(
+  p_body      text,
+  p_kind      text default 'text',
+  p_file_name text default null,
+  p_file_path text default null,
+  p_file_size bigint default null,
+  p_source    text default ''
+) returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+declare
+  v_id uuid; lim json; n int; recent int;
+begin
+  lim := draft_limits();
+
+  if p_body is null or p_body = '' then
+    raise exception '内容是空的，没什么可存';
+  end if;
+
+  if length(p_body) > (lim->>'maxBody')::int then
+    raise exception '单条内容太长（上限 % 字，这条 % 字），请拆分后再发',
+      (lim->>'maxBody')::int, length(p_body);
+  end if;
+
+  if p_file_name is not null and length(p_file_name) > (lim->>'maxName')::int then
+    raise exception '文件名太长（上限 % 字）', (lim->>'maxName')::int;
+  end if;
+
+  /* 总量闸门：先整理再继续丢，不然队列无限增长 */
+  select count(*) into n from drafts where deleted_at is null;
+  if n >= (lim->>'maxPending')::int then
+    raise exception '草稿箱已满（% 条未整理），请先整理或清理再添加',
+      (lim->>'maxPending')::int;
+  end if;
+
+  /* 频率闸门：按 p_source 计。空 source 归为同一组（'anon'）。
+     ⚠ 不做这个的话，无密钥入口等于可以被无限调用。 */
+  select count(*) into recent from drafts
+   where deleted_at is null
+     and created_at > now() - interval '1 minute'
+     and coalesce(nullif(source,''),'anon') = coalesce(nullif(p_source,''),'anon');
+  if recent >= (lim->>'perMinute')::int then
+    raise exception '这个来源发得太快了（每分钟上限 % 条），稍后再试',
+      (lim->>'perMinute')::int;
+  end if;
+
+  insert into drafts (kind, body, file_name, file_path, file_size, source)
+  values (coalesce(p_kind,'text'), p_body, p_file_name, p_file_path, p_file_size, p_source)
+  returning id into v_id;
+
+  /* ⚠ 返回服务端时间 —— 调用方要用它来确认"我这条排在哪"，
+     而客户端自己的钟可能是错的。 */
+  return json_build_object('ok', true, 'id', v_id,
+    'createdAt', (select created_at from drafts where id = v_id));
+end;
+$$;
+
+/* ----------------------------------------------------------------
+   draft_list —— ★ 需要 token。整理端取待办。
+   ⚠ 按**服务端时间戳**排序（提出人要求）。
+---------------------------------------------------------------- */
+create or replace function draft_list(
+  p_token text, p_limit int default 200, p_include_done boolean default false
+) returns json
+language plpgsql stable security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform api_check(p_token);
+  perform api_touch(p_token);
+  if p_limit > 500 then p_limit := 500; end if;
+  return json_build_object('ok', true, 'drafts', coalesce((
+    select json_agg(json_build_object(
+      'id', x.id, 'kind', x.kind, 'body', x.body,
+      'fileName', x.file_name, 'filePath', x.file_path, 'fileSize', x.file_size,
+      'source', x.source, 'createdAt', x.created_at, 'sortSeq', x.sort_seq
+    )) from (
+      select d.id, d.kind, d.body, d.file_name, d.file_path, d.file_size,
+             d.source, d.created_at, d.sort_seq
+        from drafts d
+       where (p_include_done or d.deleted_at is null)
+       /* ★ 时间正序：先来的先整理。
+          ⚠ 必须带 sort_seq 兜底：时间戳精确到微秒，理论上仍可能撞，
+          撞了顺序就不确定。加上自增序号，次序才是**唯一确定**的 ——
+          同一批整理端每次拉到的顺序完全一致，
+          否则"删掉已整理的"和"还没整理的"会混在一起。 */
+       order by d.created_at asc, d.sort_seq asc
+       limit p_limit
+    ) x
+  ), '[]'::json));
+end;
+$$;
+
+/* ----------------------------------------------------------------
+   draft_del —— ★ 需要 token。整理端清理。逻辑删除。
+---------------------------------------------------------------- */
+create or replace function draft_del(p_token text, p_id uuid) returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform api_check(p_token, true);       -- 删除算写操作
+  perform api_touch(p_token);
+  update drafts set deleted_at = now()
+   where id = p_id and deleted_at is null;
+  if not found then
+    raise exception '这条不存在或已经删过了';
+  end if;
+  return json_build_object('ok', true);
+end;
+$$;
+
+/* 批量删：整理完一批，一次清掉，省得一条条调 */
+create or replace function draft_del_many(p_token text, p_ids uuid[]) returns json
+language plpgsql volatile security definer
+set search_path = public, extensions, pg_temp as $$
+declare n int;
+begin
+  perform api_check(p_token, true);
+  perform api_touch(p_token);
+  with d as (
+    update drafts set deleted_at = now()
+     where id = any(coalesce(p_ids,'{}')) and deleted_at is null
+    returning 1
+  ) select count(*) into n from d;
+  return json_build_object('ok', true, 'deleted', n);
+end;
+$$;
+
+/* ----------------------------------------------------------------
+   draft_prompt —— ★ 自带提示词
+----------------------------------------------------------------
+   ⚠ 提示词放在**服务端**而不是写死在调用方：
+     · 改提示词不用改所有客户端
+     · 整理端每次开工前拉一次，拿到的永远是最新的
+   ⚠ 需要 token —— 提示词里含内部规则，
+     不该让任何能访问到这个库的人读到。 */
+create or replace function draft_prompt(p_token text) returns json
+language plpgsql stable security definer
+set search_path = public, extensions, pg_temp as $$
+begin
+  perform api_check(p_token);
+  perform api_touch(p_token);
+  return json_build_object('ok', true, 'prompt',
+'你是一个档案整理助手。下面是"草稿箱"里的待整理内容，按时间正序排列（先来的在前）。
+
+## 你的工作
+
+对每一条草稿：
+1. 判断它属于哪个人（profiles 里有名单）。判断不出就归为"未归属"，**不要猜**。
+2. 用 api_entry_add 把原始内容存入大日记（原文原样，不要润色）。
+3. 用 api_entry_polish 写入整理后的版本 —— 只润色流畅度：
+   理顺句子、修正错别字、口语转书面。
+   **不许加推断、不许加评价、不许润色出原文没有的信息。**
+4. 如果内容里有可以归类的事实（生日、经历、偏好……），
+   用 api_note_add 存成小日记，**source_ids 指回原条目**，要能回溯。
+   事发时间记不清就留空，**不要猜一个填进去**。
+5. 整理完用 draft_del 或 draft_del_many 把这条从草稿箱删掉。
+
+## 三条硬规矩
+
+- **原文永不被覆盖。** 任何接口都不能改 profile_entries.body，
+  你只能写 polished 列。整理结果永远新增，不覆盖旧的。
+- **记不清就不填。** 档案里一个错的时间/地点，比"未知"更有害。
+- **不许编造。** 原文没说的，一个字都不许加。
+
+## 顺序
+
+按 createdAt 从早到晚处理。处理完一条删一条。');
+end;
+$$;
+
+grant execute on function draft_limits() to anon, authenticated;
+grant execute on function draft_add(text, text, text, text, bigint, text) to anon, authenticated;
+grant execute on function draft_list(text, int, boolean) to anon, authenticated;
+grant execute on function draft_del(text, uuid) to anon, authenticated;
+grant execute on function draft_del_many(text, uuid[]) to anon, authenticated;
+grant execute on function draft_prompt(text) to anon, authenticated;
+
+
+/* ==================================================================
+   Q-Chat-S-131：兜底 —— 收权限 + 开 RLS
+   ⚠ 必须在**所有建表之后**执行，否则后建的表不受这两句约束。
+     这也是为什么它放在文件末尾而不是开头。
+================================================================== */
+
+/* ① 收回匿名/认证角色对所有表的直接读写。
+     所有访问都应该走 SECURITY DEFINER 函数（函数内部自带 acl_require 闸门）。
+   ⚠ 这一句是最后一道防线：函数层写漏了，数据层还能拦住。
+     报告里"只要有人补一句 grant，档案立刻裸奔"说的正是缺了它。 */
+revoke all on all tables in schema public from anon, authenticated;
+
+/* ② 逐表显式开 RLS。
+     ⚠ 不建任何 policy —— 没有 policy 意味着默认拒绝，
+     这正是我们要的：数据只能经函数层出去。
+     建了 permissive policy 反而可能放行。
+     ⚠ 用 alter 不用 create：这些表可能已存在。 */
+alter table profiles           enable row level security;
+alter table profile_entries    enable row level security;
+alter table profile_notes      enable row level security;
+alter table profile_summaries  enable row level security;
+alter table profile_media      enable row level security;
+alter table api_tokens         enable row level security;
+alter table drafts             enable row level security;
+
+/* ③ 序列也要收（bigserial 的序列默认可能给 anon 有 usage） */
+revoke all on all sequences in schema public from anon, authenticated;
